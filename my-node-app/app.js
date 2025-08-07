@@ -1,5 +1,6 @@
 import express from 'express';
 import ollama from 'ollama';
+import { Porcupine } from '@picovoice/porcupine-node';
 
 const app = express();
 const port = 3000;
@@ -68,9 +69,32 @@ app.post('/chat', async (req, res) => {
 
 
 
+// Wake word detection endpoint
+app.post('/wake-word', async (req, res) => {
+  try {
+    const { audioData } = req.body;
+    
+    if (!audioData) {
+      return res.status(400).json({ error: 'Audio data is required' });
+    }
+
+    // For now, return a simple response since we need to set up the model
+    // In a real implementation, you would process the audio with Porcupine
+    res.json({ 
+      detected: false,
+      message: 'Wake word detection will be implemented when model is downloaded'
+    });
+    
+  } catch (error) {
+    console.error('Wake word error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Pornim serverul Express
 app.listen(port, () => {
   console.log(`Serverul Express a pornit pe http://localhost:${port}`);
   console.log('Endpoint-ul /health este disponibil.');
   console.log('Endpoint-ul /chat (POST) este disponibil.');
+  console.log('Endpoint-ul /wake-word (POST) este disponibil.');
 });

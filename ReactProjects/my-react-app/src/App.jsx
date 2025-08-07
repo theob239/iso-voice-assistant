@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import './App.css'; 
+import './App.css';
 
 function App() {
   // State for the current input message
@@ -16,6 +16,8 @@ function App() {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [speechError, setSpeechError] = useState('');
+  // Wake word states
+  const [isWakeWordListening, setIsWakeWordListening] = useState(false);
 
   const chatWindowRef = useRef(null);
   const recognitionRef = useRef(null);
@@ -133,6 +135,31 @@ function App() {
   const handleInputChange = (e) => {
     setMessage(e.target.value);
   };
+
+// Send audio to backend for wake word detection
+const sendAudioToBackend = async (audioBlob) => {
+  try {
+    const formData = new FormData();
+    formData.append('audioData', audioBlob);
+    
+    const response = await fetch('http://localhost:3000/wake-word', {
+      method: 'POST',
+      body: formData
+    });
+    
+    const result = await response.json();
+    
+    if (result.detected) {
+      console.log('Wake word detected!');
+      // Start normal speech recognition
+      if (recognitionRef.current) {
+        recognitionRef.current.start();
+      }
+    }
+  } catch (error) {
+    console.error('Wake word error:', error);
+  }
+};
 
   // Handle microphone button click
   const handleMicrophoneClick = () => {
@@ -458,6 +485,38 @@ function App() {
             Send
           </button>
           
+          {/* Wake word toggle button */}
+          <button
+            onClick={() => {
+              if (isWakeWordListening) {
+                setIsWakeWordListening(false);
+                // Stop wake word listening
+              } else {
+                setIsWakeWordListening(true);
+                // Start wake word listening
+                console.log('Wake word listening started');
+              }
+            }}
+            style={{
+              padding: '10px',
+              backgroundColor: isWakeWordListening ? '#28a745' : '#6c757d',
+              color: 'white',
+              border: 'none',
+              borderRadius: '50%',
+              cursor: 'pointer',
+              width: '40px',
+              height: '40px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: '16px',
+              marginRight: '5px',
+            }}
+            title={isWakeWordListening ? 'Wake word listening - Click to stop' : 'Start wake word detection'}
+          >
+            🔔
+          </button>
+
           {/* Microphone button */}
           <button
             onClick={handleMicrophoneClick}
