@@ -85,3 +85,10 @@ jspm_packages/
 
 # TernJS port file
 .tern-port 
+
+ReactProjects/my-react-app/node_modules/
+my-node-app/node_modules/
+ReactProjects/my-react-app/.vite/
+ReactProjects/my-react-app/dist/
+my-node-app/.env
+.ppn

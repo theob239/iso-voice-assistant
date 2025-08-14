@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import './App.css';
 
 function App() {
@@ -18,9 +18,109 @@ function App() {
   const [speechError, setSpeechError] = useState('');
   // Wake word states
   const [isWakeWordListening, setIsWakeWordListening] = useState(false);
+  const [wakeWordDetected, setWakeWordDetected] = useState(false);
+  const [wakeWordTranscript, setWakeWordTranscript] = useState('');
+  const [memory, setMemory] = useState('');
+  const [answer, setAnswer] = useState('');
 
   const chatWindowRef = useRef(null);
   const recognitionRef = useRef(null);
+  const wakeWordRecognitionRef = useRef(null);
+  // Recent short-term memory stacks (refs to avoid unnecessary re-renders)
+  const recentUsersRef = useRef([]);
+  const recentAssistantsRef = useRef([]);
+
+  // Initialize wake word detection using Web Speech API
+  useEffect(() => {
+    if (isWakeWordListening && !wakeWordRecognitionRef.current) {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      
+      if (SpeechRecognition) {
+        wakeWordRecognitionRef.current = new SpeechRecognition();
+        wakeWordRecognitionRef.current.continuous = true;
+        wakeWordRecognitionRef.current.interimResults = true;
+        wakeWordRecognitionRef.current.lang = 'en-US';
+        
+        wakeWordRecognitionRef.current.onresult = (event) => {
+          let finalTranscript = '';
+          let interimTranscript = '';
+          
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {
+              finalTranscript += transcript + ' ';
+            } else {
+              interimTranscript += transcript;
+            }
+          }
+          
+          const fullTranscript = finalTranscript + interimTranscript;
+          setWakeWordTranscript(fullTranscript);
+          
+          // Check if "wake up" is detected (only if not already detected)
+          if (fullTranscript.toLowerCase().includes('wake up') && !wakeWordDetected) {
+            setWakeWordDetected(true);
+            // Stop wake word listening and start normal speech recognition
+            setIsWakeWordListening(false);
+            setWakeWordDetected(false);
+            setWakeWordTranscript('');
+            // Wait a moment for cleanup, then start normal speech recognition
+            setTimeout(() => {
+              // Make sure normal speech recognition is not already running
+              if (recognitionRef.current && recognitionRef.current.state === 'inactive') {
+                handleMicrophoneClick();
+              } else {
+                // Wait a bit longer and try again
+                setTimeout(() => {
+                  handleMicrophoneClick();
+                }, 500);
+              }
+            }, 200);
+          }
+        };
+        
+        wakeWordRecognitionRef.current.onstart = () => {};
+        
+        wakeWordRecognitionRef.current.onerror = (event) => {
+          console.error('Wake word recognition error:', event.error);
+          setSpeechError(`Wake word error: ${event.error}`);
+        };
+        
+        wakeWordRecognitionRef.current.onend = () => {
+          if (isWakeWordListening && wakeWordRecognitionRef.current) {
+            // Restart if still supposed to be listening and ref exists
+            try {
+              wakeWordRecognitionRef.current.start();
+            } catch (error) {
+              console.error('Failed to restart wake word detection:', error);
+            }
+          }
+        };
+        
+        // Start wake word detection
+        try {
+          wakeWordRecognitionRef.current.start();
+        } catch (error) {
+          console.error('Failed to start wake word detection:', error);
+          setSpeechError(`Failed to start wake word detection: ${error.message}`);
+        }
+      } else {
+        setSpeechError('Speech recognition not supported in this browser');
+      }
+    }
+    
+    // Cleanup when stopping wake word detection
+    if (!isWakeWordListening && wakeWordRecognitionRef.current) {
+      try {
+        wakeWordRecognitionRef.current.stop();
+      } catch (error) {
+        console.error('Error stopping wake word detection:', error);
+      }
+      wakeWordRecognitionRef.current = null;
+      setWakeWordTranscript('');
+      setWakeWordDetected(false);
+    }
+  }, [isWakeWordListening]);
 
   // Initialize speech recognition
   useEffect(() => {
@@ -43,13 +143,12 @@ function App() {
       recognitionRef.current.maxAlternatives = 1;
       
       // Set timeout to prevent hanging
-      recognitionRef.current.timeout = 10000;
+      recognitionRef.current.timeout = 25000;
 
       recognitionRef.current.onstart = () => {
         setIsListening(true);
         setTranscript('');
         setSpeechError('');
-        console.log('Speech recognition started');
       };
 
       recognitionRef.current.onresult = (event) => {
@@ -102,7 +201,6 @@ function App() {
 
       recognitionRef.current.onend = () => {
         setIsListening(false);
-        console.log('Speech recognition ended');
         
         // If we have a final transcript, keep it in the message field
         if (transcript.trim() && !message.trim()) {
@@ -136,33 +234,78 @@ function App() {
     setMessage(e.target.value);
   };
 
-// Send audio to backend for wake word detection
-const sendAudioToBackend = async (audioBlob) => {
-  try {
-    const formData = new FormData();
-    formData.append('audioData', audioBlob);
-    
-    const response = await fetch('http://localhost:3000/wake-word', {
-      method: 'POST',
-      body: formData
-    });
-    
-    const result = await response.json();
-    
-    if (result.detected) {
-      console.log('Wake word detected!');
-      // Start normal speech recognition
-      if (recognitionRef.current) {
-        recognitionRef.current.start();
+  // Roll-up: integrate an older pair into long-term memory
+  const updateMemoryAfterAnswer = async (userMessageText, answerText) => {
+    if (!answerText || !answerText.trim()) return;
+    try {
+      const summaryPrompt = `Update the long-term memory below by integrating only durable facts, user preferences, decisions, and commitments from the following user message and assistant answer. Do not include ephemeral chit-chat. Keep it concise but specific. Output the UPDATED MEMORY only, plain text.
+
+Previous memory:
+${memory || ''}
+
+User message:
+${userMessageText}
+
+Assistant answer:
+${answerText}`;
+
+      const response = await fetch('http://localhost:3000/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        credentials: 'include',
+        body: JSON.stringify({ 
+          message: summaryPrompt
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to update memory');
       }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let newSummary = '';
+      
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.content) {
+                newSummary += data.content;
+              }
+            } catch {}
+          }
+        }
+      }
+
+      setMemory(newSummary.trim());
+    } catch (error) {
+      console.error('Error updating memory:', error);
     }
-  } catch (error) {
-    console.error('Wake word error:', error);
-  }
-};
+  };
+
+  // Handle wake word toggle
+  const handleWakeWordToggle = () => {
+    if (!isWakeWordListening) {
+      // Start wake word detection
+      setIsWakeWordListening(true);
+      setSpeechError(''); // Clear any previous errors
+    } else {
+      // Stop wake word detection
+      setIsWakeWordListening(false);
+      setSpeechError(''); // Clear any previous errors
+    }
+  };
 
   // Handle microphone button click
-  const handleMicrophoneClick = () => {
+  const handleMicrophoneClick = useCallback(() => {
     if (!recognitionRef.current) {
       setSpeechError('Speech recognition not supported in this browser');
       return;
@@ -172,13 +315,27 @@ const sendAudioToBackend = async (audioBlob) => {
       recognitionRef.current.stop();
     } else {
       try {
-        recognitionRef.current.start();
+        // Make sure it's not already running
+        if (recognitionRef.current.state === 'inactive') {
+          recognitionRef.current.start();
+        } else {
+          recognitionRef.current.stop();
+          // Wait a moment then start
+          setTimeout(() => {
+            try {
+              recognitionRef.current.start();
+            } catch (error) {
+              console.error('Error starting speech recognition after stop:', error);
+              setSpeechError('Failed to start speech recognition after stop');
+            }
+          }, 100);
+        }
       } catch (error) {
         console.error('Error starting speech recognition:', error);
         setSpeechError('Failed to start speech recognition');
       }
     }
-  };
+  }, [isListening]);
 
   // Handle sending a message (user presses send or Enter)
   const handleSendMessage = async () => {
@@ -198,13 +355,32 @@ const sendAudioToBackend = async (audioBlob) => {
     setChatHistory((prevHistory) => [...prevHistory, { sender: 'bot', text: '' }]);
 
     try {
-      // Send the message to the backend /chat endpoint
+      // Build prompt using memory and up to last 3 completed pairs (most recent last)
+      let messageToSend = userMessageText;
+      const pairCount = Math.min(recentUsersRef.current.length, recentAssistantsRef.current.length);
+      const startIdx = Math.max(0, pairCount - 3);
+      const recentPairs = [];
+      for (let i = startIdx; i < pairCount; i++) {
+        recentPairs.push(`User: ${recentUsersRef.current[i]}\nAssistant: ${recentAssistantsRef.current[i]}`);
+      }
+      const recentBlock = recentPairs.length > 0 ? `\n\nRecent conversation (most recent last):\n${recentPairs.join('\n\n')}` : '';
+      if ((memory && memory.trim().length > 0) || recentPairs.length > 0) {
+        messageToSend = `Instruction: Use the provided context only to inform your answer. Do not quote or restate the context. Do not include role labels or step markers. Respond directly and concisely to the next message.${recentBlock}\n\nContext (optional):\n${memory || ''}\n\nNext message:\n${userMessageText}`.trim();
+      }
+
+      // After building context, push the current user message into the short-term stack
+      recentUsersRef.current.push(userMessageText);
+
+      // Send the message to the backend /chat endpoint (ONLY when Send button is pressed)
       const response = await fetch('http://localhost:3000/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ message: userMessageText }),
+        credentials: 'include',
+        body: JSON.stringify({ 
+          message: messageToSend
+        }),
       });
 
       if (!response.ok) {
@@ -216,6 +392,7 @@ const sendAudioToBackend = async (audioBlob) => {
       const reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8');
       let done = false;
+      let responseEnded = false;
       let accumulated = '';
       let botIndex = null;
       let firstChunk = true;
@@ -230,14 +407,16 @@ const sendAudioToBackend = async (audioBlob) => {
 
       // Helper: reveal characters from the queue one by one for smooth animation
       const revealNextChar = () => {
+        const REVEAL_CHUNK_SIZE = 16;
         if (charQueue.length > 0) {
-          accumulated += charQueue.shift();
+          const chunk = charQueue.splice(0, REVEAL_CHUNK_SIZE).join('');
+          accumulated += chunk;
           setChatHistory((prevHistory) => {
             const updated = [...prevHistory];
             updated[botIndex] = { sender: 'bot', text: accumulated };
             return updated;
           });
-          revealTimeout = setTimeout(revealNextChar, 10); // Change this for slower/faster typing
+          revealTimeout = setTimeout(revealNextChar, 0);
         } else {
           revealTimeout = null;
         }
@@ -271,6 +450,7 @@ const sendAudioToBackend = async (audioBlob) => {
             }
             if (line.startsWith('event: end')) {
               done = true;
+              responseEnded = true;
             }
             if (line.startsWith('event: error')) {
               done = true;
@@ -289,6 +469,18 @@ const sendAudioToBackend = async (audioBlob) => {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       setIsTyping(false); // Ensure typing indicator is hidden at the end
+      // After stream fully ended and all queued chars revealed, update short-term stacks and long-term memory
+      if (responseEnded && accumulated.trim().length > 0) {
+        setAnswer(accumulated);
+        // Push assistant answer into short-term stack
+        recentAssistantsRef.current.push(accumulated);
+        // If both stacks exceed 3, roll up oldest pairs into long-term memory
+        while (recentUsersRef.current.length > 3 && recentAssistantsRef.current.length > 3) {
+          const poppedUser = recentUsersRef.current.shift();
+          const poppedAssistant = recentAssistantsRef.current.shift();
+          await updateMemoryAfterAnswer(poppedUser, poppedAssistant);
+        }
+      }
     } catch (error) {
       // Handle errors and show error message in chat
       console.error('Eroare la trimiterea mesajului:', error);
@@ -329,18 +521,61 @@ const sendAudioToBackend = async (audioBlob) => {
       }}>Jarvis 0.1</h1>
       
       {/* Speech mode indicator */}
-      {speechError && (
-        <div style={{
-          padding: '5px 15px',
-          backgroundColor: '#dc3545',
-          color: 'white',
-          borderRadius: '4px',
-          marginBottom: '10px',
-          fontSize: '0.9rem',
-        }}>
-          {speechError}
-        </div>
-      )}
+              {speechError && (
+          <div style={{
+            padding: '5px 15px',
+            backgroundColor: '#dc3545',
+            color: 'white',
+            borderRadius: '4px',
+            marginBottom: '10px',
+            fontSize: '0.9rem',
+          }}>
+            {speechError}
+          </div>
+        )}
+        
+        {/* Removed Porcupine error message */}
+        
+                 {!isWakeWordListening && (
+           <div style={{
+             padding: '5px 15px',
+             backgroundColor: '#17a2b8',
+             color: 'white',
+             borderRadius: '4px',
+             marginBottom: '10px',
+             fontSize: '0.9rem',
+           }}>
+             Wake word detection is off. Click the 🔔 button to start.
+           </div>
+         )}
+         
+         {isWakeWordListening && (
+           <div style={{
+             padding: '5px 15px',
+             backgroundColor: '#28a745',
+             color: 'white',
+             borderRadius: '4px',
+             marginBottom: '10px',
+             fontSize: '0.9rem',
+           }}>
+             🔔 Listening for "wake up"... {wakeWordTranscript && `(Heard: "${wakeWordTranscript}")`}
+           </div>
+         )}
+         
+         {wakeWordDetected && (
+           <div style={{
+             padding: '5px 15px',
+             backgroundColor: '#ffc107',
+             color: '#212529',
+             borderRadius: '4px',
+             marginBottom: '10px',
+             fontSize: '0.9rem',
+           }}>
+             🎯 Wake word detected! Starting speech recognition...
+           </div>
+         )}
+         
+
       
       {/* Main chat box */}
       <div style={{
@@ -487,16 +722,7 @@ const sendAudioToBackend = async (audioBlob) => {
           
           {/* Wake word toggle button */}
           <button
-            onClick={() => {
-              if (isWakeWordListening) {
-                setIsWakeWordListening(false);
-                // Stop wake word listening
-              } else {
-                setIsWakeWordListening(true);
-                // Start wake word listening
-                console.log('Wake word listening started');
-              }
-            }}
+            onClick={handleWakeWordToggle}
             style={{
               padding: '10px',
               backgroundColor: isWakeWordListening ? '#28a745' : '#6c757d',
@@ -511,8 +737,10 @@ const sendAudioToBackend = async (audioBlob) => {
               justifyContent: 'center',
               fontSize: '16px',
               marginRight: '5px',
+              transition: 'all 0.3s ease',
             }}
             title={isWakeWordListening ? 'Wake word listening - Click to stop' : 'Start wake word detection'}
+
           >
             🔔
           </button>

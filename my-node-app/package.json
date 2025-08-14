@@ -14,8 +14,13 @@
   "description": "",
   "dependencies": {
     "@picovoice/porcupine-node": "^3.0.6",
+    "@picovoice/porcupine-react": "^3.0.3",
     "@picovoice/web-voice-processor": "^4.0.9",
+    "bcryptjs": "^3.0.2",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.6.1",
     "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
     "ollama": "^0.5.16"
   }
 }
