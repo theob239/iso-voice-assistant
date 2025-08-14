@@ -24,6 +24,42 @@ const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
 const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE) ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE) : null;
 const USE_SUPABASE = !!supabase;
+const MODEL_NAME = process.env.OLLAMA_MODEL || 'llama3.1';
+
+// Tool: get weather for a city via OSM + Open-Meteo
+async function geocodeCity(city) {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(city)}&limit=1`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'vsp-jarvis/1.0 (weather-tool)' } });
+  if (!res.ok) throw new Error('Geocoding failed');
+  const arr = await res.json();
+  if (!Array.isArray(arr) || arr.length === 0) throw new Error('City not found');
+  const { lat, lon, display_name } = arr[0];
+  return { latitude: Number(lat), longitude: Number(lon), displayName: display_name };
+}
+
+async function fetchWeather(lat, lon) {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current_weather=true`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Weather fetch failed');
+  const data = await res.json();
+  const cw = data.current_weather || data.current || {};
+  const temperature = cw.temperature ?? cw.temperature_2m;
+  const wind = cw.windspeed ?? cw.wind_speed_10m;
+  const time = cw.time || data.time || '';
+  return { temperature, wind, time };
+}
+
+async function getWeatherForCity(city) {
+  const g = await geocodeCity(city);
+  const w = await fetchWeather(g.latitude, g.longitude);
+  return `Weather for ${g.displayName}: ${w.temperature}°C, wind ${w.wind} km/h (as of ${w.time}).`;
+}
+
+const SYSTEM_PROMPT = `You are a helpful assistant.
+Priorities:
+1) Answer directly when you know the information.
+2) Use a tool ONLY when the user requests current/real-time information that you cannot know (e.g., current weather).
+3) When a tool result is provided, ground your answer in that data and be concise.`;
 
 // Hardcoded user (can be replaced by DB later)
 const HARDCODED_USER = {
@@ -585,15 +621,54 @@ app.post('/chat', async (req, res) => {
       }
     }
 
-    // Stream model response
-        const stream = await ollama.chat({
-            model: 'llama3.1',
-            messages: [{ role: 'user', content: message }],
-            stream: true
-        });
+    // Prepare tools and messages
+    const tools = [
+      {
+        type: 'function',
+        function: {
+          name: 'get_weather_for_city',
+          description: 'Get the current weather for a city',
+          parameters: {
+            type: 'object',
+            properties: { city: { type: 'string', description: 'City name' } },
+            required: ['city']
+          }
+        }
+      }
+    ];
+
+    let messages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: message }
+    ];
 
     let assistantAccum = '';
-        for await (const chunk of stream) {
+    // Step 1: non-stream detect tool calls
+    try {
+      const first = await ollama.chat({ model: MODEL_NAME, messages, tools, stream: false });
+      const tc = first.tool_calls || first.message?.tool_calls || [];
+      if (Array.isArray(tc) && tc.length > 0) {
+        for (const call of tc) {
+          const fname = call.function?.name;
+          let args = call.function?.arguments;
+          if (typeof args === 'string') { try { args = JSON.parse(args); } catch {} }
+          args = args || {};
+          if (fname === 'get_weather_for_city') {
+            const city = args.city || userText || 'Bucharest';
+            let result = '';
+            try { result = await getWeatherForCity(city); }
+            catch (e) { result = `Error: ${e.message}`; }
+            messages.push({ role: 'tool', content: result, name: 'get_weather_for_city' });
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Tool detect failed:', e.message);
+    }
+
+    // Step 2: final streamed answer with any tool results included
+    const finalStream = await ollama.chat({ model: MODEL_NAME, messages, tools, stream: true });
+    for await (const chunk of finalStream) {
             if (chunk.message && chunk.message.content) {
         assistantAccum += chunk.message.content;
                 res.write(`data: ${JSON.stringify({ content: chunk.message.content })}\n\n`);
