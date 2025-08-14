@@ -2,21 +2,14 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import './App.css';
 
 function App() {
-  // State for the current input message
   const [message, setMessage] = useState('');
-  // State for the chat history (array of {sender, text})
   const [chatHistory, setChatHistory] = useState([]);
-  // State to indicate if a message is being sent/response is loading
   const [isLoading, setIsLoading] = useState(false);
-  // State to control the animated typing indicator
   const [isTyping, setIsTyping] = useState(false);
-  // State for the animated dots in the typing indicator
   const [dotCount, setDotCount] = useState(1);
-  // Speech recognition states
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [speechError, setSpeechError] = useState('');
-  // Wake word states
   const [isWakeWordListening, setIsWakeWordListening] = useState(false);
   const [wakeWordDetected, setWakeWordDetected] = useState(false);
   const [wakeWordTranscript, setWakeWordTranscript] = useState('');
@@ -27,7 +20,6 @@ function App() {
   const chatWindowRef = useRef(null);
   const recognitionRef = useRef(null);
   const wakeWordRecognitionRef = useRef(null);
-  // Recent short-term memory stacks (refs to avoid unnecessary re-renders)
   const recentUsersRef = useRef([]);
   const recentAssistantsRef = useRef([]);
 
@@ -144,7 +136,7 @@ function App() {
       recognitionRef.current.maxAlternatives = 1;
       
       // Set timeout to prevent hanging
-      recognitionRef.current.timeout = 25000;
+      recognitionRef.current.timeout = 5000;
 
       recognitionRef.current.onstart = () => {
         setIsListening(true);
@@ -327,7 +319,7 @@ ${answerText}`;
               recognitionRef.current.start();
             } catch (error) {
               console.error('Error starting speech recognition after stop:', error);
-              setSpeechError('Failed to start speech recognition after stop');
+              //setSpeechError('Failed to start speech recognition after stop');
             }
           }, 100);
         }
@@ -385,7 +377,7 @@ ${answerText}`;
     }
   };
 
-  // Load conversations on mount (pick most recent) and hydrate chat
+  // Load conversations on mount (pick most recent)
   const [conversations, setConversations] = useState([]);
   useEffect(() => {
     const loadLatest = async () => {
@@ -421,7 +413,7 @@ ${answerText}`;
       const data = await res.json();
       if (!res.ok) return;
       const replies = Array.isArray(data.replies) ? data.replies : [];
-      // Map to chatHistory format
+      // how to format chatHistory
       const history = replies.map(r => ({ sender: r.author === 'user' ? 'user' : 'bot', text: r.content }));
       setChatHistory(history);
       setConversationId(id);
@@ -433,14 +425,14 @@ ${answerText}`;
         const mem = await memRes.json();
         if (memRes.ok && typeof mem?.memory === 'string') setMemory(mem.memory);
       } catch {}
-      // Rehydrate short-term stacks with last up to 3 pairs
+      // Push short-term stacks with last up to 3 pairs
       const users = [];
       const assistants = [];
       for (let i = 0; i < replies.length; i++) {
         if (replies[i].author === 'user') {
           const u = replies[i].content;
           let a = '';
-          // next assistant message (if any)
+          // next assistant message
           if (i + 1 < replies.length && replies[i + 1].author === 'assistant') {
             a = replies[i + 1].content;
           }
@@ -464,7 +456,7 @@ ${answerText}`;
       if (res.ok && Array.isArray(data.conversations)) setConversations(data.conversations);
     } catch {}
   };
-
+// should not be this hard to do (took me 2 hours)
   const handleDeleteConversation = async (id) => {
     try {
       const res = await fetch(`http://localhost:3000/conversations/${id}`, { method: 'DELETE', credentials: 'include' });
@@ -492,7 +484,7 @@ ${answerText}`;
 
   // Handle sending a message (user presses send or Enter)
   const handleSendMessage = async () => {
-    if (!message.trim() || isLoading) return; // Prevent sending empty or duplicate messages
+    if (!message.trim() || isLoading) return;
 
     const userMessageText = message;
     // Add user's message to chat
@@ -513,7 +505,7 @@ ${answerText}`;
       if (!convId) {
         convId = await createConversation();
       }
-      // No client-side logging; server handles it
+
       // Build prompt using memory and up to last 3 completed pairs (most recent last)
       let messageToSend = userMessageText;
       const pairCount = Math.min(recentUsersRef.current.length, recentAssistantsRef.current.length);
@@ -566,7 +558,7 @@ ${answerText}`;
         return prevHistory;
       });
 
-      // Helper: reveal characters from the queue one by one for smooth animation
+      // reveal characters from the queue one by one for smooth animation
       const revealNextChar = () => {
         const REVEAL_CHUNK_SIZE = 16;
         if (charQueue.length > 0) {
@@ -607,7 +599,7 @@ ${answerText}`;
                     revealNextChar();
                   }
                 }
-              } catch (e) { /* ignore parse errors */ }
+              } catch (e) { /* have to do it later, right now ignore parse errors */ }
             }
             if (line.startsWith('event: end')) {
               done = true;
@@ -635,7 +627,7 @@ ${answerText}`;
         setAnswer(accumulated);
         // Push assistant answer into short-term stack
         recentAssistantsRef.current.push(accumulated);
-        // If both stacks exceed 3, roll up oldest pairs into long-term memory
+        // If both stacks exceed 3, push up oldest pairs into long-term memory
         while (recentUsersRef.current.length > 3 && recentAssistantsRef.current.length > 3) {
           const poppedUser = recentUsersRef.current.shift();
           const poppedAssistant = recentAssistantsRef.current.shift();
@@ -727,7 +719,7 @@ ${answerText}`;
           width: '900px', display: 'flex', alignItems: 'center', justifyContent: 'center',
           padding: '20px 0 10px 0', color: '#fff'
         }}>
-          <h1 style={{ margin: 0, fontSize: '2rem' }}>Jarvis 0.1</h1>
+          <h1 style={{ margin: 0, fontSize: '2rem' }}>Jarvis DEMO</h1>
         </div>
         {speechError && (
           <div style={{ padding: '5px 15px', backgroundColor: '#dc3545', color: 'white', borderRadius: '4px', marginBottom: '10px', fontSize: '0.9rem' }}>

@@ -25,6 +25,7 @@ const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
 const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE) ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE) : null;
 const USE_SUPABASE = !!supabase;
 const MODEL_NAME = process.env.OLLAMA_MODEL || 'llama3.1';
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
 
 // Tool: get weather for a city via OSM + Open-Meteo
 async function geocodeCity(city) {
@@ -55,10 +56,29 @@ async function getWeatherForCity(city) {
   return `Weather for ${g.displayName}: ${w.temperature}°C, wind ${w.wind} km/h (as of ${w.time}).`;
 }
 
+// Tool: Tavily web search (recent web information)
+async function tavilySearch(query) {
+  if (!TAVILY_API_KEY) throw new Error('Tavily API key missing');
+  const res = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: TAVILY_API_KEY, query, search_depth: 'basic', include_answer: true })
+  });
+  if (!res.ok) throw new Error('Tavily request failed');
+  const data = await res.json();
+  const answer = data.answer || '';
+  const results = Array.isArray(data.results) ? data.results.slice(0, 3) : [];
+  const bullets = results.map((r, i) => `- ${r.title || 'Result ' + (i+1)}: ${r.snippet || ''} (${r.url || ''})`).join('\n');
+  const composed = `Web search summary for "${query}":\n${answer}\nSources:\n${bullets}`;
+  return composed.trim();
+}
+
 const SYSTEM_PROMPT = `You are a helpful assistant.
 Priorities:
 1) Answer directly when you know the information.
-2) Use a tool ONLY when the user requests current/real-time information that you cannot know (e.g., current weather).
+2) Use a tool ONLY when needed:
+   - get_weather_for_city: for current/local weather requests.
+   - tavily_search: for recent or web-specific information.
 3) When a tool result is provided, ground your answer in that data and be concise.`;
 
 // Hardcoded user (can be replaced by DB later)
@@ -634,6 +654,18 @@ app.post('/chat', async (req, res) => {
             required: ['city']
           }
         }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'tavily_search',
+          description: 'Search the web for recent information and concise summaries',
+          parameters: {
+            type: 'object',
+            properties: { query: { type: 'string', description: 'Search query' } },
+            required: ['query']
+          }
+        }
       }
     ];
 
@@ -659,6 +691,12 @@ app.post('/chat', async (req, res) => {
             try { result = await getWeatherForCity(city); }
             catch (e) { result = `Error: ${e.message}`; }
             messages.push({ role: 'tool', content: result, name: 'get_weather_for_city' });
+          } else if (fname === 'tavily_search') {
+            const query = args.query || userText || message;
+            let result = '';
+            try { result = await tavilySearch(query); }
+            catch (e) { result = `Error: ${e.message}`; }
+            messages.push({ role: 'tool', content: result, name: 'tavily_search' });
           }
         }
       }
