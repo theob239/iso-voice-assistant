@@ -22,6 +22,7 @@ function App() {
   const [wakeWordTranscript, setWakeWordTranscript] = useState('');
   const [memory, setMemory] = useState('');
   const [answer, setAnswer] = useState('');
+  const [conversationId, setConversationId] = useState(null);
 
   const chatWindowRef = useRef(null);
   const recognitionRef = useRef(null);
@@ -337,6 +338,158 @@ ${answerText}`;
     }
   }, [isListening]);
 
+  // Handle logout
+  const handleLogout = async () => {
+    try {
+      await fetch('http://localhost:3000/auth/logout', {
+        method: 'POST',
+        credentials: 'include',
+      });
+    } catch (e) {
+      // ignore errors; proceed to redirect
+    } finally {
+      window.location.replace('/login');
+    }
+  };
+
+  // Conversations API helpers
+  const createConversation = async () => {
+    try {
+      const res = await fetch('http://localhost:3000/conversations', {
+        method: 'POST',
+        credentials: 'include',
+      });
+      const data = await res.json();
+      if (res.ok && data?.conversation?.id) {
+        setConversationId(data.conversation.id);
+        try { localStorage.setItem('conversationId', data.conversation.id); } catch {}
+        // refresh list so it appears immediately
+        try { await refreshConversations(); } catch {}
+        return data.conversation.id;
+      }
+    } catch {}
+    return null;
+  };
+
+  const handleNewChat = async () => {
+    // reset UI and memory stacks, then create a new conversation
+    setChatHistory([]);
+    setMemory('');
+    setAnswer('');
+    recentUsersRef.current = [];
+    recentAssistantsRef.current = [];
+    try { localStorage.removeItem('conversationId'); } catch {}
+    const id = await createConversation();
+    if (id) {
+      await loadConversation(id);
+    }
+  };
+
+  // Load conversations on mount (pick most recent) and hydrate chat
+  const [conversations, setConversations] = useState([]);
+  useEffect(() => {
+    const loadLatest = async () => {
+      try {
+        const res = await fetch('http://localhost:3000/conversations', {
+          method: 'GET',
+          credentials: 'include',
+        });
+        const data = await res.json();
+        if (!res.ok || !data?.conversations || data.conversations.length === 0) {
+          return; // nothing yet
+        }
+        setConversations(data.conversations);
+        // Try localStorage lastId if it belongs to this list; otherwise load latest
+        let targetId = null;
+        try {
+          const stored = localStorage.getItem('conversationId');
+          if (stored && data.conversations.some(c => c.id === stored)) targetId = stored;
+        } catch {}
+        if (!targetId) targetId = data.conversations[0].id;
+        await loadConversation(targetId);
+      } catch (_) {}
+    };
+    loadLatest();
+  }, []);
+
+  const loadConversation = async (id) => {
+    try {
+      const res = await fetch(`http://localhost:3000/conversations/${id}/replies`, {
+        method: 'GET',
+        credentials: 'include',
+      });
+      const data = await res.json();
+      if (!res.ok) return;
+      const replies = Array.isArray(data.replies) ? data.replies : [];
+      // Map to chatHistory format
+      const history = replies.map(r => ({ sender: r.author === 'user' ? 'user' : 'bot', text: r.content }));
+      setChatHistory(history);
+      setConversationId(id);
+      // Save last used conversation id
+      try { localStorage.setItem('conversationId', id); } catch {}
+      // Load persisted memory
+      try {
+        const memRes = await fetch(`http://localhost:3000/conversations/${id}/memory`, { credentials: 'include' });
+        const mem = await memRes.json();
+        if (memRes.ok && typeof mem?.memory === 'string') setMemory(mem.memory);
+      } catch {}
+      // Rehydrate short-term stacks with last up to 3 pairs
+      const users = [];
+      const assistants = [];
+      for (let i = 0; i < replies.length; i++) {
+        if (replies[i].author === 'user') {
+          const u = replies[i].content;
+          let a = '';
+          // next assistant message (if any)
+          if (i + 1 < replies.length && replies[i + 1].author === 'assistant') {
+            a = replies[i + 1].content;
+          }
+          if (u && a) {
+            users.push(u);
+            assistants.push(a);
+          }
+        }
+      }
+      recentUsersRef.current = users.slice(-3);
+      recentAssistantsRef.current = assistants.slice(-3);
+      return true;
+    } catch (_) { return false; }
+  };
+
+  // Refresh conversation list
+  const refreshConversations = async () => {
+    try {
+      const res = await fetch('http://localhost:3000/conversations', { credentials: 'include' });
+      const data = await res.json();
+      if (res.ok && Array.isArray(data.conversations)) setConversations(data.conversations);
+    } catch {}
+  };
+
+  const handleDeleteConversation = async (id) => {
+    try {
+      const res = await fetch(`http://localhost:3000/conversations/${id}`, { method: 'DELETE', credentials: 'include' });
+      if (!res.ok) {
+        let msg = 'Failed to delete conversation';
+        try { const data = await res.json(); if (data?.error) msg = data.error; } catch {}
+        alert(msg);
+        return;
+      }
+      const updated = conversations.filter((c) => c.id !== id);
+      setConversations(updated);
+      if (id === conversationId) {
+        if (updated.length > 0) {
+          await loadConversation(updated[0].id);
+        } else {
+          setConversationId(null);
+          setChatHistory([]);
+          setMemory('');
+        }
+      }
+    } catch (e) {
+      alert('Delete failed. Check your connection.');
+    }
+  };
+
   // Handle sending a message (user presses send or Enter)
   const handleSendMessage = async () => {
     if (!message.trim() || isLoading) return; // Prevent sending empty or duplicate messages
@@ -355,6 +508,12 @@ ${answerText}`;
     setChatHistory((prevHistory) => [...prevHistory, { sender: 'bot', text: '' }]);
 
     try {
+      // Ensure we have a conversation id
+      let convId = conversationId;
+      if (!convId) {
+        convId = await createConversation();
+      }
+      // No client-side logging; server handles it
       // Build prompt using memory and up to last 3 completed pairs (most recent last)
       let messageToSend = userMessageText;
       const pairCount = Math.min(recentUsersRef.current.length, recentAssistantsRef.current.length);
@@ -379,7 +538,9 @@ ${answerText}`;
         },
         credentials: 'include',
         body: JSON.stringify({ 
-          message: messageToSend
+          message: messageToSend,
+          userText: userMessageText,
+          conversationId
         }),
       });
 
@@ -480,6 +641,7 @@ ${answerText}`;
           const poppedAssistant = recentAssistantsRef.current.shift();
           await updateMemoryAfterAnswer(poppedUser, poppedAssistant);
         }
+        // Server already logs assistant reply and updates memory
       }
     } catch (error) {
       // Handle errors and show error message in chat
@@ -498,95 +660,109 @@ ${answerText}`;
   // Render the chat UI
   return (
     <div className="App" style={{
-      height: '100vh',
-      width: '100vw',
-      margin: 0,
-      padding: 0,
-      boxSizing: 'border-box',
-      display: 'flex',
-      flexDirection: 'column',
-      alignItems: 'center',
-      justifyContent: 'center',
-      backgroundColor: '#222',
+      height: '100vh', width: '100vw', margin: 0, padding: 0,
+      boxSizing: 'border-box', display: 'grid', gridTemplateColumns: '1fr 900px 1fr',
+      gridTemplateRows: 'auto 1fr',
+      backgroundColor: '#222'
     }}>
-      {/* Title at the top */}
-      <h1 style={{
-        margin: 0,
-        padding: '20px 0 10px 0',
-        textAlign: 'center',
-        backgroundColor: '#222',
-        color: '#fff',
-        fontSize: '2rem',
-        flex: '0 0 auto',
-      }}>Jarvis 0.1</h1>
-      
-      {/* Speech mode indicator */}
-              {speechError && (
-          <div style={{
-            padding: '5px 15px',
-            backgroundColor: '#dc3545',
-            color: 'white',
-            borderRadius: '4px',
-            marginBottom: '10px',
-            fontSize: '0.9rem',
-          }}>
+      {/* Global logout (fixed top-right) */}
+      <button onClick={handleLogout} style={{
+        position: 'fixed',
+        top: 16,
+        right: 16,
+        padding: '8px 12px',
+        backgroundColor: '#dc3545',
+        color: 'white',
+        border: 'none',
+        borderRadius: '4px',
+        cursor: 'pointer',
+        zIndex: 1000
+      }}>Logout</button>
+
+      {/* Left panel: New Chat + Conversation Picker */}
+      <div style={{
+        gridColumn: '1 / 2', gridRow: '1 / span 2',
+        margin: 16, background: '#1e1e1e', border: '1px solid #2a2a2a',
+        borderRadius: 8, padding: 12, boxShadow: '0 6px 24px rgba(0,0,0,0.5)',
+        display: 'flex', flexDirection: 'column', gap: 10, overflow: 'hidden',
+        width: 'clamp(220px, calc((100vw - 900px)/2 - 32px), 300px)'
+      }}>
+        <button onClick={handleNewChat} style={{
+          padding: '10px 12px', backgroundColor: '#17a2b8', color: 'white',
+          border: 'none', borderRadius: 6, cursor: 'pointer', fontSize: 15
+        }}>+ New Chat</button>
+        <div style={{ color: '#bbb', fontSize: 14 }}>Conversations</div>
+        <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 6, width: '100%' }}>
+          {conversations.map((c) => (
+            <div key={c.id} style={{
+              display: 'flex', alignItems: 'center', gap: 6
+            }}>
+              <button onClick={() => loadConversation(c.id)} style={{
+                textAlign: 'left', padding: '8px 10px', borderRadius: 6,
+                border: '1px solid #333', background: c.id === conversationId ? '#2f2f2f' : '#262626',
+                color: '#eee', cursor: 'pointer', flex: 1, fontSize: 13,
+                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+              }}>
+                {(c.title && c.title.trim()) ? c.title : new Date(c.created_at).toLocaleString()}
+              </button>
+              <button onClick={async (e) => {
+                e.stopPropagation();
+                await handleDeleteConversation(c.id);
+              }} title="Delete" style={{
+                width: 36, height: 24, border: '1px solid #555', borderRadius: 6,
+                background: '#3a3a3a', color: '#ff6b6b', cursor: 'pointer', fontWeight: 700,
+                fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'center'
+              }}>DEL</button>
+            </div>
+          ))}
+          {conversations.length === 0 && (
+            <div style={{ color: '#666', fontSize: 12 }}>No conversations yet</div>
+          )}
+        </div>
+      </div>
+
+      {/* Header + status centered */}
+      <div style={{ gridColumn: '2 / 3', width: '900px', justifySelf: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', marginTop: '20px' }}>
+        <div style={{
+          width: '900px', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          padding: '20px 0 10px 0', color: '#fff'
+        }}>
+          <h1 style={{ margin: 0, fontSize: '2rem' }}>Jarvis 0.1</h1>
+        </div>
+        {speechError && (
+          <div style={{ padding: '5px 15px', backgroundColor: '#dc3545', color: 'white', borderRadius: '4px', marginBottom: '10px', fontSize: '0.9rem' }}>
             {speechError}
           </div>
         )}
-        
-        {/* Removed Porcupine error message */}
-        
-                 {!isWakeWordListening && (
-           <div style={{
-             padding: '5px 15px',
-             backgroundColor: '#17a2b8',
-             color: 'white',
-             borderRadius: '4px',
-             marginBottom: '10px',
-             fontSize: '0.9rem',
-           }}>
-             Wake word detection is off. Click the 🔔 button to start.
-           </div>
-         )}
-         
-         {isWakeWordListening && (
-           <div style={{
-             padding: '5px 15px',
-             backgroundColor: '#28a745',
-             color: 'white',
-             borderRadius: '4px',
-             marginBottom: '10px',
-             fontSize: '0.9rem',
-           }}>
-             🔔 Listening for "wake up"... {wakeWordTranscript && `(Heard: "${wakeWordTranscript}")`}
-           </div>
-         )}
-         
-         {wakeWordDetected && (
-           <div style={{
-             padding: '5px 15px',
-             backgroundColor: '#ffc107',
-             color: '#212529',
-             borderRadius: '4px',
-             marginBottom: '10px',
-             fontSize: '0.9rem',
-           }}>
-             🎯 Wake word detected! Starting speech recognition...
-           </div>
-         )}
+        {!isWakeWordListening && (
+          <div style={{ padding: '5px 15px', backgroundColor: '#17a2b8', color: 'white', borderRadius: '4px', marginBottom: '10px', fontSize: '0.9rem' }}>
+            Wake word detection is off. Click the 🔔 button to start.
+          </div>
+        )}
+        {isWakeWordListening && (
+          <div style={{ padding: '5px 15px', backgroundColor: '#28a745', color: 'white', borderRadius: '4px', marginBottom: '10px', fontSize: '0.9rem' }}>
+            🔔 Listening for "wake up"... {wakeWordTranscript && `(Heard: "${wakeWordTranscript}")`}
+          </div>
+        )}
+        {wakeWordDetected && (
+          <div style={{ padding: '5px 15px', backgroundColor: '#ffc107', color: '#212529', borderRadius: '4px', marginBottom: '10px', fontSize: '0.9rem' }}>
+            🎯 Wake word detected! Starting speech recognition...
+          </div>
+        )}
+      </div>
          
 
       
       {/* Main chat box */}
       <div style={{
-        width: '800px',
+        gridColumn: '2 / 3', width: '900px', justifySelf: 'center',
         height: '500px',
         backgroundColor: '#222',
         borderRadius: '12px',
         boxShadow: '0 4px 24px rgba(0,0,0,0.4)',
         display: 'flex',
         flexDirection: 'column',
-        marginTop: '10px',
+        marginTop: '50px',
       }}>
         {/* Chat window: shows all messages */}
         <div className="chat-window" ref={chatWindowRef} style={{

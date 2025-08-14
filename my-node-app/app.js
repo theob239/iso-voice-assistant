@@ -4,6 +4,11 @@ import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import { promises as fs } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createClient } from '@supabase/supabase-js';
+import crypto from 'node:crypto';
 
 // Load environment variables from .env file
 console.log('Loading environment variables...');
@@ -15,6 +20,10 @@ const port = process.env.PORT || 3000;
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const AUTH_REQUIRED = (process.env.AUTH_REQUIRED || 'false').toLowerCase() === 'true';
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
+const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE) ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE) : null;
+const USE_SUPABASE = !!supabase;
 
 // Hardcoded user (can be replaced by DB later)
 const HARDCODED_USER = {
@@ -22,6 +31,97 @@ const HARDCODED_USER = {
   name: process.env.DEMO_NAME || 'Demo User',
   passwordHash: bcrypt.hashSync(process.env.DEMO_PASSWORD || 'demo1234', 10),
 };
+
+// Simple file-based users store (used if Supabase not configured)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DATA_DIR = path.join(__dirname, 'data');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const CONV_DIR = path.join(DATA_DIR, 'conversations');
+
+async function ensureDataDir() {
+  try { await fs.mkdir(DATA_DIR, { recursive: true }); } catch {}
+}
+
+async function readUsers() {
+  try {
+    const raw = await fs.readFile(USERS_FILE, 'utf-8');
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+async function writeUsers(users) {
+  await ensureDataDir();
+  await fs.writeFile(USERS_FILE, JSON.stringify(users, null, 2), 'utf-8');
+}
+
+// File-based conversations helpers (fallback when Supabase not configured)
+async function ensureConvDir() {
+  try { await fs.mkdir(CONV_DIR, { recursive: true }); } catch {}
+}
+
+function userConvPath(username) {
+  return path.join(CONV_DIR, `conv_${username}.json`);
+}
+
+async function readUserConvs(username) {
+  await ensureConvDir();
+  try {
+    const raw = await fs.readFile(userConvPath(username), 'utf-8');
+    return JSON.parse(raw);
+  } catch {
+    return { conversations: [], replies: {} }; // replies: { [convId]: [{author, content, created_at}] }
+  }
+}
+
+async function writeUserConvs(username, data) {
+  await ensureConvDir();
+  await fs.writeFile(userConvPath(username), JSON.stringify(data, null, 2), 'utf-8');
+}
+
+// Supabase memory helpers
+async function supabaseGetMemory(conversationId) {
+  if (!USE_SUPABASE) return null;
+  const { data, error } = await supabase
+    .from('conversation_memory')
+    .select('memory_text')
+    .eq('conversation_id', conversationId)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? data.memory_text : null;
+}
+
+async function supabaseUpsertMemory(conversationId, memoryText) {
+  if (!USE_SUPABASE) return null;
+  const { error } = await supabase
+    .from('conversation_memory')
+    .upsert({ conversation_id: conversationId, memory_text: memoryText }, { onConflict: 'conversation_id' });
+  if (error) throw error;
+}
+
+async function supabaseFindUserByUsername(username) {
+  if (!USE_SUPABASE) return null;
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, username, name, password_hash')
+    .eq('username', username)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function supabaseCreateUser({ username, name, passwordHash }) {
+  if (!USE_SUPABASE) return null;
+  const { data, error } = await supabase
+    .from('users')
+    .insert([{ username, name, password_hash: passwordHash }])
+    .select('id, username, name')
+    .single();
+  if (error) throw error;
+  return data;
+}
 
 function createAccessToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '15m' });
@@ -75,7 +175,12 @@ app.use(cookieParser());
 // Auth middleware (enabled when AUTH_REQUIRED=true)
 function authRequired(req, res, next) {
   if (!AUTH_REQUIRED) return next();
-  if (req.path.startsWith('/auth/login') || req.path.startsWith('/auth/refresh') || req.path.startsWith('/health')) {
+  if (
+    req.path.startsWith('/auth/login') ||
+    req.path.startsWith('/auth/refresh') ||
+    req.path.startsWith('/auth/register') ||
+    req.path.startsWith('/health')
+  ) {
     return next();
   }
   const token = req.cookies?.access_token;
@@ -98,20 +203,278 @@ app.get('/health', (req, res) => {
   res.status(200).send('Backend is running!');
 });
 
+// Current user info (requires auth)
+app.get('/auth/me', (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+  return res.json({ ok: true, user: { username: req.user.username, name: req.user.name } });
+});
+
+// Conversations API
+app.post('/conversations', async (req, res) => {
+  try {
+    const username = req.user?.username || 'anonymous';
+    const id = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
+    if (USE_SUPABASE) {
+      const { data, error } = await supabase
+        .from('conversations')
+        .insert([{ username }])
+        .select('id, created_at')
+        .single();
+      if (error) throw error;
+      return res.json({ ok: true, conversation: data });
+    } else {
+      const store = await readUserConvs(username);
+      const conv = { id, username, created_at: new Date().toISOString() };
+      store.conversations.unshift(conv);
+      await writeUserConvs(username, store);
+      return res.json({ ok: true, conversation: conv });
+    }
+  } catch (e) {
+    console.error('Create conversation error', e);
+    return res.status(500).json({ error: 'Failed to create conversation' });
+  }
+});
+
+app.get('/conversations', async (req, res) => {
+  try {
+    const username = req.user?.username || 'anonymous';
+    if (USE_SUPABASE) {
+      let data, error;
+      // First try with optional title column
+      ({ data, error } = await supabase
+        .from('conversations')
+        .select('id, created_at, title')
+        .eq('username', username)
+        .order('created_at', { ascending: false }));
+      if (error) {
+        // Fallback if 'title' column doesn't exist
+        ({ data, error } = await supabase
+          .from('conversations')
+          .select('id, created_at')
+          .eq('username', username)
+          .order('created_at', { ascending: false }));
+        if (error) throw error;
+      }
+      return res.json({ ok: true, conversations: data });
+    } else {
+      const store = await readUserConvs(username);
+      return res.json({ ok: true, conversations: store.conversations });
+    }
+  } catch (e) {
+    console.error('List conversations error', e);
+    return res.status(500).json({ error: 'Failed to list conversations' });
+  }
+});
+
+app.get('/conversations/:id/replies', async (req, res) => {
+  try {
+    const username = req.user?.username || 'anonymous';
+    const { id } = req.params;
+    // ownership check
+    if (USE_SUPABASE) {
+      const { data: conv, error: convErr } = await supabase
+        .from('conversations')
+        .select('id')
+        .eq('id', id)
+        .eq('username', username)
+        .maybeSingle();
+      if (convErr) throw convErr;
+      if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+    } else {
+      const store = await readUserConvs(username);
+      const has = (store.conversations || []).some(c => c.id === id);
+      if (!has) return res.status(404).json({ error: 'Conversation not found' });
+    }
+    if (USE_SUPABASE) {
+      const { data, error } = await supabase
+        .from('conversation_replies')
+        .select('author, content, created_at')
+        .eq('conversation_id', id)
+        .order('created_at', { ascending: true });
+      if (error) throw error;
+      return res.json({ ok: true, replies: data });
+    } else {
+      const store = await readUserConvs(username);
+      const replies = store.replies[id] || [];
+      return res.json({ ok: true, replies });
+    }
+  } catch (e) {
+    console.error('Get replies error', e);
+    return res.status(500).json({ error: 'Failed to get replies' });
+  }
+});
+
+// Return conversation memory (summary)
+app.get('/conversations/:id/memory', async (req, res) => {
+  try {
+    const username = req.user?.username || 'anonymous';
+    const { id } = req.params;
+    // ownership check
+    if (USE_SUPABASE) {
+      const { data: conv, error: convErr } = await supabase
+        .from('conversations')
+        .select('id')
+        .eq('id', id)
+        .eq('username', username)
+        .maybeSingle();
+      if (convErr) throw convErr;
+      if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+      const memory = await supabaseGetMemory(id);
+      return res.json({ ok: true, memory: memory || '' });
+    } else {
+      // file-based memory: embed in a pseudo key under replies store
+      const store = await readUserConvs(username);
+      const memKey = `__memory_${id}`;
+      const memory = store[memKey] || '';
+      return res.json({ ok: true, memory });
+    }
+  } catch (e) {
+    console.error('Get memory error', e);
+    return res.status(500).json({ error: 'Failed to get memory' });
+  }
+});
+
+app.post('/conversations/:id/replies', async (req, res) => {
+  try {
+    const username = req.user?.username || 'anonymous';
+    const { id } = req.params;
+    const { author, content } = req.body || {};
+    if (!author || !content || !['user','assistant'].includes(author)) {
+      return res.status(400).json({ error: 'Invalid payload' });
+    }
+    // ownership check
+    if (USE_SUPABASE) {
+      const { data: conv, error: convErr } = await supabase
+        .from('conversations')
+        .select('id')
+        .eq('id', id)
+        .eq('username', username)
+        .maybeSingle();
+      if (convErr) throw convErr;
+      if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+    } else {
+      const store = await readUserConvs(username);
+      const has = (store.conversations || []).some(c => c.id === id);
+      if (!has) return res.status(404).json({ error: 'Conversation not found' });
+    }
+    if (USE_SUPABASE) {
+      const { error } = await supabase
+        .from('conversation_replies')
+        .insert([{ conversation_id: id, author, content }]);
+      if (error) throw error;
+      return res.json({ ok: true });
+    } else {
+      const store = await readUserConvs(username);
+      if (!store.replies[id]) store.replies[id] = [];
+      store.replies[id].push({ author, content, created_at: new Date().toISOString() });
+      await writeUserConvs(username, store);
+      return res.json({ ok: true });
+    }
+  } catch (e) {
+    console.error('Append reply error', e);
+    return res.status(500).json({ error: 'Failed to append reply' });
+  }
+});
+
+// Upsert memory text for a conversation
+app.post('/conversations/:id/memory', async (req, res) => {
+  try {
+    const username = req.user?.username || 'anonymous';
+    const { id } = req.params;
+    const { memory } = req.body || {};
+    if (typeof memory !== 'string') return res.status(400).json({ error: 'Invalid memory' });
+    // ownership check
+    if (USE_SUPABASE) {
+      const { data: conv, error: convErr } = await supabase
+        .from('conversations')
+        .select('id')
+        .eq('id', id)
+        .eq('username', username)
+        .maybeSingle();
+      if (convErr) throw convErr;
+      if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+      await supabaseUpsertMemory(id, memory);
+      return res.json({ ok: true });
+    } else {
+      const store = await readUserConvs(username);
+      const memKey = `__memory_${id}`;
+      store[memKey] = memory;
+      await writeUserConvs(username, store);
+      return res.json({ ok: true });
+    }
+  } catch (e) {
+    console.error('Update memory error', e);
+    return res.status(500).json({ error: 'Failed to update memory' });
+  }
+});
 // Auth endpoints
+app.post('/auth/register', async (req, res) => {
+  const { username, name, password } = req.body || {};
+  if (!username || !name || !password) {
+    return res.status(400).json({ error: 'username, name, password are required' });
+  }
+  try {
+    const passwordHash = bcrypt.hashSync(password, 10);
+    let payload;
+    if (USE_SUPABASE) {
+      const existing = await supabaseFindUserByUsername(username);
+      if (existing) return res.status(409).json({ error: 'Username already exists' });
+      const created = await supabaseCreateUser({ username, name, passwordHash });
+      payload = { username: created.username, name: created.name };
+    } else {
+      const users = await readUsers();
+      if (users.find(u => u.username.toLowerCase() === String(username).toLowerCase())) {
+        return res.status(409).json({ error: 'Username already exists' });
+      }
+      const user = { id: Date.now().toString(), username, name, passwordHash, createdAt: new Date().toISOString() };
+      users.push(user);
+      await writeUsers(users);
+      payload = { username: user.username, name: user.name };
+    }
+    // Auto-login after registration
+    const access = createAccessToken(payload);
+    const refresh = createRefreshToken(payload);
+    const isProd = process.env.NODE_ENV === 'production';
+    const cookieOpts = { httpOnly: true, sameSite: 'lax', secure: isProd, path: '/' };
+    res.cookie('access_token', access, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
+    res.cookie('refresh_token', refresh, { ...cookieOpts, maxAge: 7 * 24 * 60 * 60 * 1000 });
+    return res.json({ ok: true, user: payload });
+  } catch (e) {
+    console.error('Register error', e);
+    return res.status(500).json({ error: 'Register failed' });
+  }
+});
+
 app.post('/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ error: 'username and password are required' });
   }
-  if (username !== HARDCODED_USER.username) {
-    return res.status(401).json({ error: 'Invalid credentials' });
+  // Try Supabase first, then file-based, then hardcoded
+  let payload;
+  if (USE_SUPABASE) {
+    const found = await supabaseFindUserByUsername(username);
+    if (!found) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = bcrypt.compareSync(password, found.password_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    payload = { username: found.username, name: found.name };
+  } else {
+    const users = await readUsers();
+    const found = users.find(u => u.username.toLowerCase() === String(username).toLowerCase());
+    if (found) {
+      const ok = bcrypt.compareSync(password, found.passwordHash);
+      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+      payload = { username: found.username, name: found.name };
+    } else {
+      // Fallback to hardcoded user
+      if (username !== HARDCODED_USER.username) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      const ok = bcrypt.compareSync(password, HARDCODED_USER.passwordHash);
+      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+      payload = { username: HARDCODED_USER.username, name: HARDCODED_USER.name };
+    }
   }
-  const ok = bcrypt.compareSync(password, HARDCODED_USER.passwordHash);
-  if (!ok) {
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
-  const payload = { username: HARDCODED_USER.username, name: HARDCODED_USER.name };
   const access = createAccessToken(payload);
   const refresh = createRefreshToken(payload);
 
@@ -156,12 +519,28 @@ app.post('/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-// Endpoint pentru chat cu Ollama
+// Endpoint pentru chat cu Ollama cu logare server-side
 app.post('/chat', async (req, res) => {
-    const { message, context } = req.body; // Extragem mesajul și contextul din corpul cererii
+  const { message, userText, conversationId } = req.body || {};
+  if (!message) return res.status(400).send('Mesajul este necesar în corpul cererii.');
 
-    if (!message) {
-        return res.status(400).send('Mesajul este necesar în corpul cererii.');
+  // Ownership check if conversationId provided
+  const username = req.user?.username || 'anonymous';
+  async function verifyOwnership() {
+    if (!conversationId) return true;
+    if (USE_SUPABASE) {
+      const { data, error } = await supabase
+        .from('conversations')
+        .select('id')
+        .eq('id', conversationId)
+        .eq('username', username)
+        .maybeSingle();
+      if (error) throw error;
+      return !!data;
+    } else {
+      const store = await readUserConvs(username);
+      return (store.conversations || []).some(c => c.id === conversationId);
+    }
     }
 
     try {
@@ -170,34 +549,142 @@ app.post('/chat', async (req, res) => {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
 
-        // Use the message as-is since context is already included in the message
-        let fullMessage = message;
-        console.log('Processing message with embedded context');
+    let ownershipOk = true;
+    try { ownershipOk = await verifyOwnership(); } catch (e) { ownershipOk = false; }
+    if (conversationId && !ownershipOk) {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: 'Unauthorized conversation' })}\n\n`);
+      return res.end();
+    }
 
-        // Folosim stream: true pentru a primi chunk-uri de la Ollama
+    // Save user message first (best-effort)
+    if (conversationId && userText && userText.trim()) {
+      try {
+        if (USE_SUPABASE) {
+          await supabase.from('conversation_replies').insert([{ conversation_id: conversationId, author: 'user', content: userText }]);
+          // set title if empty
+          try {
+            await supabase
+              .from('conversations')
+              .update({ title: userText.slice(0, 120) })
+              .eq('id', conversationId)
+              .is('title', null);
+          } catch {}
+        } else {
+          const store = await readUserConvs(username);
+          if (!store.replies[conversationId]) store.replies[conversationId] = [];
+          store.replies[conversationId].push({ author: 'user', content: userText, created_at: new Date().toISOString() });
+          // set title if empty
+          const idx = (store.conversations || []).findIndex(c => c.id === conversationId);
+          if (idx >= 0 && !store.conversations[idx].title) {
+            store.conversations[idx].title = userText.slice(0, 120);
+          }
+          await writeUserConvs(username, store);
+        }
+      } catch (e) {
+        console.warn('Failed to log user message:', e.message);
+      }
+    }
+
+    // Stream model response
         const stream = await ollama.chat({
             model: 'llama3.1',
-            messages: [{ role: 'user', content: fullMessage }],
+            messages: [{ role: 'user', content: message }],
             stream: true
         });
 
-        let responseContent = '';
+    let assistantAccum = '';
         for await (const chunk of stream) {
             if (chunk.message && chunk.message.content) {
-                responseContent += chunk.message.content;
-                // Send each chunk as an SSE event
+        assistantAccum += chunk.message.content;
                 res.write(`data: ${JSON.stringify({ content: chunk.message.content })}\n\n`);
-            }
+      }
+    }
+
+    // After stream ends, log assistant reply and update memory
+    if (conversationId && assistantAccum.trim()) {
+      try {
+        // Save assistant reply
+        if (USE_SUPABASE) {
+          await supabase.from('conversation_replies').insert([{ conversation_id: conversationId, author: 'assistant', content: assistantAccum }]);
+        } else {
+          const store = await readUserConvs(username);
+          if (!store.replies[conversationId]) store.replies[conversationId] = [];
+          store.replies[conversationId].push({ author: 'assistant', content: assistantAccum, created_at: new Date().toISOString() });
+          await writeUserConvs(username, store);
         }
-        // Signal end of stream
+
+        // Update memory summary
+        let currentMemory = '';
+        if (USE_SUPABASE) {
+          currentMemory = (await supabaseGetMemory(conversationId)) || '';
+        } else {
+          const store = await readUserConvs(username);
+          const memKey = `__memory_${conversationId}`;
+          currentMemory = store[memKey] || '';
+        }
+
+        const summaryPrompt = `Update the long-term memory below by integrating only durable facts, user preferences, decisions, and commitments from the following user message and assistant answer. Do not include ephemeral chit-chat. Keep it concise but specific. Output the UPDATED MEMORY only, plain text.\n\nPrevious memory:\n${currentMemory}\n\nUser message:\n${userText || ''}\n\nAssistant answer:\n${assistantAccum}`;
+
+        let updatedMemory = '';
+        try {
+          const memStream = await ollama.chat({ model: 'llama3.1', messages: [{ role: 'user', content: summaryPrompt }], stream: true });
+          for await (const m of memStream) {
+            if (m.message?.content) updatedMemory += m.message.content;
+          }
+        } catch (e) {
+          console.warn('Memory generation failed:', e.message);
+        }
+
+        if (updatedMemory) {
+          if (USE_SUPABASE) {
+            await supabaseUpsertMemory(conversationId, updatedMemory);
+          } else {
+            const store = await readUserConvs(username);
+            const memKey = `__memory_${conversationId}`;
+            store[memKey] = updatedMemory;
+            await writeUserConvs(username, store);
+          }
+        }
+      } catch (e) {
+        console.warn('Post-stream logging failed:', e.message);
+      }
+    }
+
         res.write('event: end\ndata: END\n\n');
         res.end();
     } catch (error) {
         console.error('Eroare la comunicarea cu Ollama:', error.message);
-        // Send error as SSE event
         res.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
         res.end();
     }
+});
+
+// Delete a conversation (and cascade)
+app.delete('/conversations/:id', async (req, res) => {
+  try {
+    const username = req.user?.username || 'anonymous';
+    const { id } = req.params;
+    if (USE_SUPABASE) {
+      const { error } = await supabase
+        .from('conversations')
+        .delete()
+        .eq('id', id)
+        .eq('username', username);
+      if (error) throw error;
+      return res.json({ ok: true });
+    } else {
+      const store = await readUserConvs(username);
+      store.conversations = (store.conversations || []).filter(c => c.id !== id);
+      if (store.replies[id]) delete store.replies[id];
+      const memKey = `__memory_${id}`;
+      if (store[memKey]) delete store[memKey];
+      await writeUserConvs(username, store);
+      return res.json({ ok: true });
+    }
+  } catch (e) {
+    console.error('Delete conversation error', e);
+    return res.status(500).json({ error: 'Failed to delete conversation' });
+  }
 });
 
 
@@ -221,7 +708,7 @@ app.post('/wake-word', async (req, res) => {
   } catch (error) {
     console.error('Wake word error:', error);
     res.status(500).json({ error: error.message });
-  }
+    }
 });
 
 // Pornim serverul Express
